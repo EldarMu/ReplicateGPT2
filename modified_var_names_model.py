@@ -5,12 +5,8 @@ I have modified names in many places where I felt like it helped me
 to understand it easier, and provided various comments.
 This is meant to be a base from which to start adding various papers'
 improvements.
-
-Please note this version changes the variable names so normal
-'from_pretrained' wouldn't work here, but I liked it for
-actively engaging with the material.
-
 """
+
 import math
 from dataclasses import dataclass
 import torch
