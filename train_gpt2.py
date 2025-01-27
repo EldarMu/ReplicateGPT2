@@ -375,8 +375,11 @@ def old_name_to_new(name):
     # if it's neither, we just return the name as-is
     return name
 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 # This is a more complex test of the model being loaded properly
 # we do the same starting text, and run it in parallel this many times.
+# this is also our batch_size, and I use that term when describing matrix dims.
 num_parallel_responses = 5
 # the maximum length of a response (including the starting text)
 max_response_len = 30
@@ -384,8 +387,8 @@ max_response_len = 30
 model = train_gpt2.GPT.from_pretrained('gpt2')
 # this means inference mode, no dropout, no batchnorm
 model.eval()
-# move the model to GPU memory.
-model.to('cuda')
+# move the model to GPU memory if GPU available.
+model.to(device)
 
 # get the tokenizer made for this model
 enc = tiktoken.get_encoding('gpt2')
@@ -394,12 +397,12 @@ enc = tiktoken.get_encoding('gpt2')
 tokens = enc.encode("Hello, I'm a language model,")
 # turn the list into a tensor of longs since models want tensors 
 tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
-# expand the 0th dimension, then repeat the tensor 5 times along that dimension
-# so, kind of like broadcast along the batch dimension.
+# add batch dimension at the beginning, and repeat tensor 5 times in it.
+# so, [1, 2, 3] -> [[1, 2, 3], ....] 5 times
 # this is how we turn the initial "hello..." into 5 parallel responses.
 tokens = tokens.unsqueeze(0).repeat(num_parallel_responses, 1) # (5, 8)
-# move the input tensor to GPU memory.
-input_data = tokens.to('cuda') # (batch_size, seq_len)
+# move the input tensor to GPU memory if GPU available.
+input_data = tokens.to(device) # (batch_size, seq_len)
 
 # set the random seeds for reproducibility
 torch.manual_seed(8)
@@ -422,15 +425,15 @@ while input_data.size(1) < max_response_len:
         # both are (batch_size, top_k) shaped.
         # topk_probs here becomes (5, 50), topk_indices is (5, 50)
         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        # multinomial is a probability distribution for multi-class classification
+        # multinomial is a probability distribution for picking from many categories.
         # picks a single index - any can be picked but
         # each has its probability's chance of being picked
         picked_ix = torch.multinomial(topk_probs, 1) # (batch_size, 1)
         # torch.gather is like "pick from this tensor at these indices"
         xcol = torch.gather(topk_indices, -1, picked_ix) # (batch_size, 1)
         # concatenate onto the existing input along dim 1 (tokens dim)
-        # note - we added the index of the next token, which is what we want
-        # since the input is a bunch of indices not actual text.
+        # note - we concatenated the *index* of the next token, since
+        # the model input is a sequence of token indices.
         input_data = torch.cat((input_data, xcol), dim=1)
 
 # print the num_parallel_responses generated completions.
