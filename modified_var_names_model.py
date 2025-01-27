@@ -254,6 +254,28 @@ class GPT(nn.Module):
           out_features=config.vocab_size,
           bias=False)
     
+    def forward(self, idx):
+      # index of shape (batch_size, seq_len)
+      batch_size, seq_len = idx.size()
+      assert seq_len <= self.config.max_seq_len, f"cannot use sequence length {seq_len} > {self.config.max_seq_len}"
+      # first we create the position tensor, it's just 0 to seq_len
+      pos = torch.arange(0, seq_len, dtype=torch.long, device=idx.device) # shape is (seq_len,)
+      # we run it through its embedding layer
+      pos_embed = self.transformer.pos_embed(pos) # shape is (seq_len, hidden_dim)
+      # then we embed the tokens with their own embedding layer
+      token_embed = self.transformer.embedding_matrix(idx) # shape is (batch_size, seq_len, hidden_dim)
+      # we add the two embeddings together, with the position embedding being broadcast along batch dimension
+      data = token_embed + pos_embed # shape is (batch_size, seq_len, hidden_dim)
+      # run through all the transformer blocks
+      for decoder in self.transformer.heads:
+        data = decoder(data)
+      # final layer norm
+      data = self.transformer.final_layernorm(data) # shape is (batch_size, seq_len, hidden_dim)
+      # run through the linear layer to get back to vocab space
+      logits = self.lm_head(data) # shape is (batch_size, seq_len, vocab_size)
+      # return un-normalized probabilities, will need to softmax to get probabilities
+      return logits
+
     @classmethod
     def from_pretrained(cls, model_type):
         """We're only really going to load one, but we can include this data for all"""
@@ -298,10 +320,7 @@ class GPT(nn.Module):
         # this means that we have to transpose these weights when we import them
         assert len(sd_keys_loaded) == len(sd_keys), f"mismatched keys: {len(sd_keys_loaded)} != {len(sd_keys)}"
         for k in sd_keys_loaded:
-            print(f"Processing key: {k}") # DEBUG PRINT
             new_key = old_name_to_new(k)
-            print(f"Translated key: {new_key}")
-            print("State dict keys:", state_dict.keys())
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
                 assert statedict_loaded[k].shape[::-1] == state_dict[new_key].shape
@@ -356,6 +375,66 @@ def old_name_to_new(name):
     # if it's neither, we just return the name as-is
     return name
 
-# this is a simple test to see if the model loads correctly
-model = GPT.from_pretrained('gpt2')
-print("didn't crash yay!")
+# This is a more complex test of the model being loaded properly
+# we do the same starting text, and run it in parallel this many times.
+num_parallel_responses = 5
+# the maximum length of a response (including the starting text)
+max_response_len = 30
+
+model = train_gpt2.GPT.from_pretrained('gpt2')
+# this means inference mode, no dropout, no batchnorm
+model.eval()
+# move the model to GPU memory.
+model.to('cuda')
+
+# get the tokenizer made for this model
+enc = tiktoken.get_encoding('gpt2')
+# this is the starting text, we're going to generate continuations for it.
+# returns list[int] of token indices
+tokens = enc.encode("Hello, I'm a language model,")
+# turn the list into a tensor of longs since models want tensors 
+tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+# expand the 0th dimension, then repeat the tensor 5 times along that dimension
+# so, kind of like broadcast along the batch dimension.
+# this is how we turn the initial "hello..." into 5 parallel responses.
+tokens = tokens.unsqueeze(0).repeat(num_parallel_responses, 1) # (5, 8)
+# move the input tensor to GPU memory.
+input_data = tokens.to('cuda') # (batch_size, seq_len)
+
+# set the random seeds for reproducibility
+torch.manual_seed(8)
+torch.cuda.manual_seed(8)
+
+# while the length of the token dim is less than our max
+while input_data.size(1) < max_response_len:
+    # no_grad means don't track gradients, so less memory used.
+    # gradients not needed since not training.
+    with torch.no_grad():
+        # model outputs pre-probability logits.
+        logits = model(input_data) # (batch, tokens, vocab_size)
+        # take the logits for the last token (the one the model predicted)
+        logits = logits[:, -1, :] # (batch, vocab_size)
+        # softmax makes the values be [0, 1] and sum to 1.
+        # dim = -1 (last) because that's where the vocab_size is.
+        probs = torchF.softmax(logits, dim=-1)
+        # basically sorts the probabilities while also keeping indices
+        # and outputs the top 50 probabilities and their indices.
+        # both are (batch_size, top_k) shaped.
+        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # multinomial is a probability distribution for multi-class classification
+        # picks a single index - any can be picked but
+        # each has its probability's chance of being picked
+        picked_ix = torch.multinomial(topk_probs, 1) # (batch_size, 1)
+        # torch.gather is like "pick from this tensor at these indices"
+        xcol = torch.gather(topk_indices, -1, picked_ix) # (batch_size, 1)
+        # concatenate onto the existing input along dim 1 (tokens dim)
+        # note - we added the index of the next token, which is what we want
+        # since the input is a bunch of indices not actual text.
+        input_data = torch.cat((input_data, xcol), dim=1)
+
+# print the num_parallel_responses generated completions.
+for i in range(num_parallel_responses):
+    tokens = input_data[i, :max_response_len].tolist()
+    decoded = enc.decode(tokens)
+    print(">", decoded)
