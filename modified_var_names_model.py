@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as torchF
+from transformers import GPT2LMHeadModel
 
 # store all the parameters up top for easy modification.
 @dataclass
@@ -256,3 +257,109 @@ class GPT(nn.Module):
           in_features=config.hidden_dim,
           out_features=config.vocab_size,
           bias=False)
+    
+    @classmethod
+    def from_pretrained(cls, model_type):
+        """We're only really going to load one, but we can include this data for all"""
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        # random debug line, why not.
+        print("loading weights from pretrained gpt: %s" % model_type)
+
+        # these are the params for GPT2Parameters from the paper.
+        config_args = {
+            'gpt2':         dict(num_decoders=12, num_heads=12, hidden_dim=768),  # 124M params
+            'gpt2-medium':  dict(num_decoders=24, num_heads=16, hidden_dim=1024), # 350M params
+            'gpt2-large':   dict(num_decoders=36, num_heads=20, hidden_dim=1280), # 774M params
+            'gpt2-xl':      dict(num_decoders=48, num_heads=25, hidden_dim=1600), # 1558M params
+        }[model_type]
+        # model_type is a key, we're declaring the full dict then pulling just one value.
+
+        # again, from paper. These are the same for all GPT2 models.
+        # rename to match our modified GPT2Parameters class.
+        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
+        config_args['max_seq_len'] = 1024 # always 1024 for GPT model checkpoints
+
+        # create a from-scratch initialized nanoGPT model
+        config = GPT2Parameters(**config_args)
+        model = GPT(config)
+        state_dict = model.state_dict()
+        # we do full mapping of names from loaded to this model later.
+        sd_keys = state_dict.keys()
+        sd_keys = [k for k in sd_keys if not k.endswith('.attention.bias')] # discard this mask / buffer, not a param
+
+        # init the huggingface/transformers model
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        statedict_loaded = model_hf.state_dict()
+
+        # all their linear layers are transposed because imported from tf, so they're gonna need
+        # to be re-transposed to match our model's expectations.
+        sd_keys_loaded = statedict_loaded.keys()
+        sd_keys_loaded = [k for k in sd_keys_loaded if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
+        sd_keys_loaded = [k for k in sd_keys_loaded if not k.endswith('.attn.bias')] # same, just the mask (buffer)
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+
+        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+        # this means that we have to transpose these weights when we import them
+        assert len(sd_keys_loaded) == len(sd_keys), f"mismatched keys: {len(sd_keys_loaded)} != {len(sd_keys)}"
+        for k in sd_keys_loaded:
+            print(f"Processing key: {k}") # DEBUG PRINT
+            new_key = old_name_to_new(k)
+            print(f"Translated key: {new_key}")
+            print("State dict keys:", state_dict.keys())
+            if any(k.endswith(w) for w in transposed):
+                # special treatment for the Conv1D weights we need to transpose
+                assert statedict_loaded[k].shape[::-1] == state_dict[new_key].shape
+                with torch.no_grad():
+                    state_dict[new_key].copy_(statedict_loaded[k].t())
+            else:
+                # vanilla copy over the other parameters
+                assert statedict_loaded[k].shape == state_dict[new_key].shape
+                with torch.no_grad():
+                    state_dict[new_key].copy_(statedict_loaded[k])
+
+        return model
+    
+# Because I insisted on naming everything according to my preferred method,
+# I need to translate the layer names from the loaded paper into my names.
+# And I need it to handle variable number of heads.
+
+common_layer_mapping = {
+    'transformer.wte.weight': 'transformer.embedding_matrix.weight',
+    'transformer.wpe.weight': 'transformer.pos_embed.weight',
+    'transformer.ln_f.weight': 'transformer.final_layernorm.weight',
+    'transformer.ln_f.bias': 'transformer.final_layernorm.bias',
+    'lm_head.weight': 'lm_head.weight'
+}
+
+head_layer_mapping = {
+       'ln_1.weight': 'ln_before_att.weight',
+       'ln_1.bias': 'ln_before_att.bias', 
+       'attn.c_attn.weight': 'attention.qkv_projection.weight',
+       'attn.c_attn.bias': 'attention.qkv_projection.bias',
+       'attn.c_proj.weight': 'attention.out_projection.weight',
+       'attn.c_proj.bias': 'attention.out_projection.bias',
+       'ln_2.weight': 'ln_before_fnn.weight',
+       'ln_2.bias': 'ln_before_fnn.bias',
+       'mlp.c_fc.weight': 'mlp.ffn1.weight', 
+       'mlp.c_fc.bias': 'mlp.ffn1.bias',
+       'mlp.c_proj.weight': 'mlp.ffn2.weight',
+       'mlp.c_proj.bias': 'mlp.ffn2.bias'
+}
+
+def old_name_to_new(name):
+    # first we check if it's a common layer
+    if name in common_layer_mapping:
+        return common_layer_mapping[name]
+    # then update transformer decoder block name
+    if 'transformer.h.' in name:
+        name = name.replace('.h.', '.heads.')
+    # then we check if it's a head layer
+    for old, new in head_layer_mapping.items():
+        if old in name:
+            return name.replace(old, new)
+    # if it's neither, we just return the name as-is
+    return name
+
+# this is a simple test to see if the model loads correctly
+model = GPT.from_pretrained('gpt2')
+print("didn't crash yay!")
