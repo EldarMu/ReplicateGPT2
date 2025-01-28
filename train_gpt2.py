@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as torchF
 from transformers import GPT2LMHeadModel
+import tiktoken
 
 # store all the parameters up top for easy modification.
 @dataclass
@@ -375,69 +376,111 @@ def old_name_to_new(name):
     # if it's neither, we just return the name as-is
     return name
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# This is a more complex test of the model being loaded properly
-# we do the same starting text, and run it in parallel this many times.
-# this is also our batch_size, and I use that term when describing matrix dims.
-num_parallel_responses = 5
-# the maximum length of a response (including the starting text)
-max_response_len = 30
+def test_model():
+  device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-model = train_gpt2.GPT.from_pretrained('gpt2')
-# this means inference mode, no dropout, no batchnorm
-model.eval()
-# move the model to GPU memory if GPU available.
-model.to(device)
+  # This is a more complex test of the model being loaded properly
+  # we do the same starting text, and run it in parallel this many times.
+  # this is also our batch_size, and I use that term when describing matrix dims.
+  num_parallel_responses = 5
+  # the maximum length of a response (including the starting text)
+  max_response_len = 30
 
-# get the tokenizer made for this model
+  model = train_gpt2.GPT.from_pretrained('gpt2')
+  # this means inference mode, no dropout, no batchnorm
+  model.eval()
+  # move the model to GPU memory if GPU available.
+  model.to(device)
+
+  # get the tokenizer made for this model
+  enc = tiktoken.get_encoding('gpt2')
+  # this is the starting text, we're going to generate continuations for it.
+  # returns list[int] of token indices
+  tokens = enc.encode("Hello, I'm a language model,")
+  # turn the list into a tensor of longs since models want tensors 
+  tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+  # add batch dimension at the beginning, and repeat tensor 5 times in it.
+  # so, [1, 2, 3] -> [[1, 2, 3], ....] 5 times
+  # this is how we turn the initial "hello..." into 5 parallel responses.
+  tokens = tokens.unsqueeze(0).repeat(num_parallel_responses, 1) # (5, 8)
+  # move the input tensor to GPU memory if GPU available.
+  input_data = tokens.to(device) # (batch_size, seq_len)
+
+  # set the random seeds for reproducibility
+  torch.manual_seed(8)
+  torch.cuda.manual_seed(8)
+
+  # while the length of the token dim is less than our max
+  while input_data.size(1) < max_response_len:
+      # no_grad means don't track gradients, so less memory used.
+      # gradients not needed since not training.
+      with torch.no_grad():
+          # model outputs pre-probability logits.
+          logits = model(input_data) # (batch, tokens, vocab_size)
+          # take the logits for the last token (the one the model predicted)
+          logits = logits[:, -1, :] # (batch, vocab_size)
+          # softmax makes the values be [0, 1] and sum to 1.
+          # dim = -1 (last) because that's where the vocab_size is.
+          probs = torchF.softmax(logits, dim=-1)
+          # basically sorts the probabilities while also keeping indices
+          # and outputs the top 50 probabilities and their indices.
+          # both are (batch_size, top_k) shaped.
+          # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+          topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+          # multinomial is a probability distribution for picking from many categories.
+          # picks a single index - any can be picked but
+          # each has its probability's chance of being picked
+          picked_ix = torch.multinomial(topk_probs, 1) # (batch_size, 1)
+          # torch.gather is like "pick from this tensor at these indices"
+          xcol = torch.gather(topk_indices, -1, picked_ix) # (batch_size, 1)
+          # concatenate onto the existing input along dim 1 (tokens dim)
+          # note - we concatenated the *index* of the next token, since
+          # the model input is a sequence of token indices.
+          input_data = torch.cat((input_data, xcol), dim=1)
+
+  # print the num_parallel_responses generated completions.
+  for i in range(num_parallel_responses):
+      tokens = input_data[i, :max_response_len].tolist()
+      decoded = enc.decode(tokens)
+      print(">", decoded)
+
+
+# !wget https://raw.githubusercontent.com/karpathy/char-rnn/refs/heads/master/data/tinyshakespeare/input.txt
+# pros: fully ascii no preprocessing needed cons: very small dataset, can easily find better ones on github or huggingface.
+
+# something about loading to cuda is busted colab with torch when we load model here.
+device = 'cpu'
+
+# get the specific tokenizer used for gpt2 to tokenize/detokenize text.
 enc = tiktoken.get_encoding('gpt2')
-# this is the starting text, we're going to generate continuations for it.
-# returns list[int] of token indices
-tokens = enc.encode("Hello, I'm a language model,")
-# turn the list into a tensor of longs since models want tensors 
-tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
-# add batch dimension at the beginning, and repeat tensor 5 times in it.
-# so, [1, 2, 3] -> [[1, 2, 3], ....] 5 times
-# this is how we turn the initial "hello..." into 5 parallel responses.
-tokens = tokens.unsqueeze(0).repeat(num_parallel_responses, 1) # (5, 8)
-# move the input tensor to GPU memory if GPU available.
-input_data = tokens.to(device) # (batch_size, seq_len)
 
-# set the random seeds for reproducibility
-torch.manual_seed(8)
-torch.cuda.manual_seed(8)
+# rename if you saved the shakespear text as something else.
+with open('input.txt', 'r') as f:
+    text = f.read()
 
-# while the length of the token dim is less than our max
-while input_data.size(1) < max_response_len:
-    # no_grad means don't track gradients, so less memory used.
-    # gradients not needed since not training.
-    with torch.no_grad():
-        # model outputs pre-probability logits.
-        logits = model(input_data) # (batch, tokens, vocab_size)
-        # take the logits for the last token (the one the model predicted)
-        logits = logits[:, -1, :] # (batch, vocab_size)
-        # softmax makes the values be [0, 1] and sum to 1.
-        # dim = -1 (last) because that's where the vocab_size is.
-        probs = torchF.softmax(logits, dim=-1)
-        # basically sorts the probabilities while also keeping indices
-        # and outputs the top 50 probabilities and their indices.
-        # both are (batch_size, top_k) shaped.
-        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        # multinomial is a probability distribution for picking from many categories.
-        # picks a single index - any can be picked but
-        # each has its probability's chance of being picked
-        picked_ix = torch.multinomial(topk_probs, 1) # (batch_size, 1)
-        # torch.gather is like "pick from this tensor at these indices"
-        xcol = torch.gather(topk_indices, -1, picked_ix) # (batch_size, 1)
-        # concatenate onto the existing input along dim 1 (tokens dim)
-        # note - we concatenated the *index* of the next token, since
-        # the model input is a sequence of token indices.
-        input_data = torch.cat((input_data, xcol), dim=1)
+# encode the text into token indices.
+tokens = enc.encode(text)
 
-# print the num_parallel_responses generated completions.
-for i in range(num_parallel_responses):
-    tokens = input_data[i, :max_response_len].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
+# Forced to use the cpu due to torch device weirdness in colab,
+# and at 12.7 gb RAM have to keep batch size low
+# together these batch/length params use 10.8 GB RAM (minus ~1.4 os/python usage)
+token_length = 128
+batch_size = 32
+# we load some portion of the dataset divisible into memory for training
+iterated_size = batch_size * token_length
+iterated_size = (len(tokens) // iterated_size) * iterated_size
+# validating here just in case.
+assert iterated_size + 1 < len(tokens), "use smaller token_length or batch_size"
+# convert token indices to floats
+buf = torch.tensor(tokens[:batch_size*token_length + 1])
+
+# exclude first token from predictions since it has no context
+predictions = buf[1:].view(batch_size, token_length)
+# exclude last token from input since it has nothing to predict
+data = buf[:-1].view(batch_size, token_length)
+
+model = train_gpt2.GPT(train_gpt2.GPT2Parameters())
+model.to(device)
+logits = model(data)
+print(logits.shape)
