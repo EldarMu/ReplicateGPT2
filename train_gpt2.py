@@ -8,6 +8,7 @@ improvements.
 """
 
 import math
+from collections import defaultdict
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -425,7 +426,7 @@ def test_model():
   # the maximum length of a response (including the starting text)
   max_response_len = 30
 
-  model = train_gpt2.GPT.from_pretrained('gpt2')
+  model = GPT.from_pretrained('gpt2')
   # this means inference mode, no dropout, no batchnorm
   model.eval()
   # move the model to GPU memory if GPU available.
@@ -508,8 +509,8 @@ def train_model():
   # convert token indices to floats
   buf = torch.tensor(tokens[:batch_size*token_length + 1])
 
-  # exclude first token from predictions since it has no context
-  predictions = buf[1:].view(batch_size, token_length)
+  # exclude first token from labels since it has no context
+  labels = buf[1:].view(batch_size, token_length)
   # exclude last token from input since it has nothing to predict
   data = buf[:-1].view(batch_size, token_length)
 
@@ -518,7 +519,7 @@ def train_model():
   optimizer = AdamW_Impl(model.parameters())
   for i in range(50):
       optimizer.zero_grad()
-      logits, loss = model(x, y)
+      logits, loss = model(data, labels)
       loss.backward()
       optimizer.step()
       print(f"step {i}, loss: {loss.item()}")
@@ -650,7 +651,7 @@ class AdamW_Impl:
             # Final update denominator,
             # exp_avg_sq.div_(bias_correction2) = v_t / (1 - beta2^t) = v_hat
             # and then the whole thing is the (sqrt(v_hat) + eps)
-            denom = math.sqrt(exp_avg_sq.div_(bias_correction2)).add_(self.eps)
+            denom = torch.sqrt(exp_avg_sq.div_(bias_correction2)).add_(self.eps)
 
             # Update the weights
             # w(t) = w(t-1) - lr * m_hat / (sqrt(v_hat) + eps)
