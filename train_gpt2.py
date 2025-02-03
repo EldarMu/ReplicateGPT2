@@ -651,7 +651,14 @@ class AdamW_Impl:
             # Final update denominator,
             # exp_avg_sq.div_(bias_correction2) = v_t / (1 - beta2^t) = v_hat
             # and then the whole thing is the (sqrt(v_hat) + eps)
-            denom = torch.sqrt(exp_avg_sq.div_(bias_correction2)).add_(self.eps)
+            #
+            # previously did this as one step like:
+            # denom = torch.sqrt(exp_avg_sq.div_(bias_correction2)).add_(self.eps)
+            # but kept getting infs/nans.
+            # now doing square rooting here, which works because
+            # sqrt(x)/sqrt(y) = sqrt(x/y)
+            bias_correction2_sqrt = bias_correction2.sqrt()
+            denom = exp_avg_sq.sqrt().div_((bias_correction2_sqrt).add_(self.eps))
 
             # Update the weights
             # w(t) = w(t-1) - lr * m_hat / (sqrt(v_hat) + eps)
