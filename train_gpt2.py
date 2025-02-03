@@ -646,7 +646,7 @@ class AdamW_Impl:
             # 1 - beta1^t
             bias_correction1 = torch.tensor(1) - torch.pow(beta1, state['step'])
             # 1 - beta2^t
-            bias_correction2 = 1 - torch.tensor(1) - torch.pow(beta2, state['step'])
+            bias_correction2 = torch.tensor(1) - torch.pow(beta2, state['step'])
 
             # Final update denominator,
             # exp_avg_sq.div_(bias_correction2) = v_t / (1 - beta2^t) = v_hat
