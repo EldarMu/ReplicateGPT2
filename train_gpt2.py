@@ -277,12 +277,13 @@ class GPT(nn.Module):
       # Get cross-entropy loss if real labels provided.
       loss = None
       if predictions is not None:
-        # logits.view(-1 = calculate this dim automatically so batch*tokens,
-        #             logits.size(-1) = vocab_size)
-        # predictions.view(-1) = starts as (B, T) now it's (B*T)
-        # May seem odd, we're calculating entropy for the whole training set,
-        # not per-batch. The reason is that this is a small model with a toy dataset.
-        loss = torchF.cross_entropy(logits.view(-1, logits.size(-1)), predictions.view(-1))
+        # logits starts as (batch_size, window, vocab_size) => (all_tokens, vocab_size)
+        # logits.view(-1 = calculate this dim automatically so batch*tokens = all_tokens,
+        #             logits.size(-1) = vocab_size dim)
+        # predictions.view(-1) = flatten so (batch_size, token_indices) turns into (all_token_indices).
+        # May seem odd, we're calculating cross entropy for the whole training set instead of per-batch,
+        # per-batch. The reason is that this is a small model with a toy dataset.
+        loss = cross_entropy_impl(logits.view(-1, logits.size(-1)), predictions.view(-1))
       
       return logits, loss
 
@@ -386,6 +387,34 @@ def old_name_to_new(name):
     return name
 
 
+def cross_entropy_impl(logits, labels):
+  """
+  Assumes logits are (input_size, vocab_size) and labels are (input_size)
+  No rearranging going to happen in here.
+  """
+  # 1. Get probabilities using softmax,
+  # apply softmax per-token so 1 since logits here are gonna be (all_tokens, vocab_size)
+  probs = torch.softmax(logits, dim=1)
+
+  # 2. Select probabilities corresponding to the true labels
+  # first get indices vector 0..input_size-1
+  index_range = torch.arange(labels.size(0))
+  # then we access probabilities by iterating like this.
+  # Indexing here is vector for rows (index_range), and vector for columns (labels)
+  # and it'll go like "for i in range(index_range/labels): probs[index_range[i], labels[i]]"
+  # and the output is a vector of scalar probabilities.
+  predicted_probs = probs[index_range, labels]
+
+  # 3. Formula for cross entropy is log(real probability) - log(predicted probability)
+  # but real probability is 1 and log(1) = 0 so the formula gets reduced to
+  # -log(predicted probability).
+  neg_log_likelihood = -torch.log(predicted_probs)
+
+  # 4. Average the loss to return a scalar value.
+  loss = torch.mean(neg_log_likelihood)
+
+  return loss
+
 def test_model():
   device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -454,7 +483,7 @@ def test_model():
       decoded = enc.decode(tokens)
       print(">", decoded)
 
-def one_epoch_training():
+def train_model():
   # !wget https://raw.githubusercontent.com/karpathy/char-rnn/refs/heads/master/data/tinyshakespeare/input.txt
   # pros: fully ascii no preprocessing needed cons: very small dataset, can easily find better ones on github or huggingface.
 
