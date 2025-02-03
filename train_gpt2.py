@@ -515,5 +515,151 @@ def train_model():
 
   model = GPT(GPT2Parameters())
   model.to(device)
-  logits, loss = model(data, predictions)
-  print(loss)
+  optimizer = AdamW_Impl(model.parameters())
+  for i in range(50):
+      optimizer.zero_grad()
+      logits, loss = model(x, y)
+      loss.backward()
+      optimizer.step()
+      print(f"step {i}, loss: {loss.item()}")
+
+class AdamW_Impl:
+    def __init__(self, params):
+        """
+        Very basic AdamW implementation.
+        Tailored to this specific model, for educational purposes.
+        Also I hardcoded values usually passed into constructor so I don't have to
+        write all kinds of "raise ValueError" checks.
+
+        AdamW formula is:
+        t = our step (iteration) value. We increment this each time we perform a step,
+        so for this implementation, it's once per epoch (since we're doing full-batch).
+        Starts at 1, not 0.
+
+        g(t) = gradient at iteration t.
+        (we get the gradients from loss.backwards() auto-populated in params for us)
+
+        Weight adjustment, for the stored weights from previous step.
+        For us this means subtract lr-adjusted 1% (1e-2) of the existing weight.
+        w(t) = w(t-1) - lr * weight_decay * w(t-1)
+        
+        first moment:
+        m(t) = beta1 * m(t-1) + (1 - beta1) * g(t)
+        For our implementation, this means 90% of previous step's smoothed gradients, 10% of current.
+        Kind of like EMA, for gradient smoothing.
+
+        second moment:
+        v(t) = beta2 * v(t-1) + (1 - beta2) * g(t)^2
+        Like EMA of the scale of the gradients.
+        This ends up in the divisor so it slows down lr when gradients are large and vice-versa.
+
+        m(t) adjustment:
+        since we start with zeros, the value would increase super slow, so we adjust it by this,
+        and since the beta is 0.9, first step is m(t)/0.1 then /0.19, then /0.27 and so on.
+        m_hat = m(t) / (1 - beta1^t)
+
+        v(t) adjustment, same idea, but /0.01, then /0.019, then /0.03 and so on.
+        v_hat = v(t) / (1 - beta2^t)
+
+        Without the betas/epsilon the final formula would be:
+        w(t) = w(t-1) - lr * g(t)/(sqrt(g(t)^2)) so like lr with gradient sign retention.
+        (just showing so it's easier for you to connect all the dots)
+
+        finally, we update the weights:
+        v_hat can easily underflow, so we add a tiny number to it.
+        w(t) = w(t-1) - lr * m_hat / (sqrt(v_hat) + eps)
+
+        so the weight gets updated by the smoothed gradient divided by the
+        smoothed scale of the gradients, multiplied by the learning rate.
+        """
+        # Learning rate
+        self.lr = 3e-4          
+        # Beta coefficients for Adam
+        # beta1 for the first moment (gradient smoothing)
+        # beta2 for the second moment (gradient scaling)
+        self.betas = (0.9, 0.999)
+        # Tiny number to prevent division by 0
+        self.eps = 1e-8
+        # How much to decay weights by on each step (1%*lr)
+        self.weight_decay = 1e-2
+
+        # Model weights and biases and some non-learnable params.
+        # Provided as a generator, turned into list here since
+        # generators are intended for one run and we might iterate more than once.
+        self.parameters = list(params)
+        # defaultdict makes it so instead of KeyError you get a default value.
+        self.state = defaultdict(dict)
+
+        # add step, first moment, second moment vars for each tensor.
+        for p in self.parameters:
+            if p.requires_grad:
+                # step gets set to 0 here because it gets incremeneted first thing in step() 
+                self.state[p]['step'] = 0
+                # initialize with same-shaped zeros tensors
+                # preserve_format = try to make the memory layout match the params layout
+                # so the gpu can do operations involving both faster.
+                self.state[p]['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                self.state[p]['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+
+    def zero_grad(self):
+        """Reset gradients to zero for all weights.
+           Don't want to pollute between epochs."""
+        for p in self.parameters:
+            if p.grad is not None:
+                p.grad.zero_()
+
+    def step(self):
+        """Performs a single optimization step."""
+        for p in self.parameters:
+            # skip non-learnable params
+            if p.grad is None:
+                continue
+
+            grad = p.grad
+            state = self.state[p]
+
+            state['step'] += 1
+            exp_avg = state['exp_avg']
+            exp_avg_sq = state['exp_avg_sq']
+            beta1, beta2 = self.betas
+            lr = self.lr
+
+            # Weight decay applied first like in pytorch's single_tensor impl.
+            # Weight decay: w(t) = w(t-1) - lr * weight_decay * w(t-1)
+            # mul_ = in-place element-wise multiplication of the tensor
+            p.data.mul_(1 - lr * self.weight_decay)
+                
+
+            # m(t) = beta1 * m(t-1) + (1 - beta1) * g(t)
+            # lerp_ = in-place per-element weighted average of two tensors (grad and exp_avg)
+            exp_avg.lerp_(grad, 1 - beta1)
+
+            # v(t) = beta2 * v(t-1) + (1 - beta2) * g(t)^2
+            # mul_ = multiply v(t-1) by beta2 in-place
+            # addcmul_ = in-place element-wise multiply grad by grad, then by (1-beta2),
+            # then add to v(t-1)
+            exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+            # m_hat and v_hat divisor calculation
+            step = state['step']
+            # 1 - beta1^t
+            bias_correction1 = 1 - beta1 ** step
+            # 1 - beta2^t
+            bias_correction2 = 1 - beta2 ** step
+
+            # Final update denominator,
+            # exp_avg_sq.div_(bias_correction2) = v_t / (1 - beta2^t) = v_hat
+            # and then the whole thing is the (sqrt(v_hat) + eps)
+            denom = math.sqrt(exp_avg_sq.div_(bias_correction2)).add_(self.eps)
+
+            # Update the weights
+            # w(t) = w(t-1) - lr * m_hat / (sqrt(v_hat) + eps)
+            # since we didn't calculate m_hat separately, and m_hat is m(t) / (1 - beta1^t)
+            # we just divide lr by (1-beta1^t) so we can use m(t) as-is.
+            step_size = lr / bias_correction1
+            # param_update = m(t) / (sqrt(v_hat) + eps)
+            param_update = exp_avg.div_(denom)
+            # alpha is just a multiplier for the values, so this is equivalent to
+            # w(t-1) = w(t-1) + (m(t) / (sqrt(v_hat) + eps))*  -(lr / (1-beta1^t))
+            # which is equivalent to w(t-1) - lr * m_hat / (sqrt(v_hat) + eps)
+            p.data.add_(param_update, alpha=-step_size)
