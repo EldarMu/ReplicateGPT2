@@ -525,7 +525,7 @@ def train_model():
       print(f"step {i}, loss: {loss.item()}")
 
 class AdamW_Impl:
-    def __init__(self, params):
+    def __init__(self, params, device):
         """
         Very basic AdamW implementation.
         Tailored to this specific model, for educational purposes.
@@ -574,15 +574,15 @@ class AdamW_Impl:
         smoothed scale of the gradients, multiplied by the learning rate.
         """
         # Learning rate
-        self.lr = torch.tensor(3e-4)          
+        self.lr = torch.tensor(3e-4).to(device)          
         # Beta coefficients for Adam
         # beta1 for the first moment (gradient smoothing)
         # beta2 for the second moment (gradient scaling)
-        self.betas = (torch.tensor(0.9), torch.tensor(0.999))
+        self.betas = (torch.tensor(0.9).to(device), torch.tensor(0.999).to(device))
         # Tiny number to prevent division by 0
-        self.eps = torch.tensor(1e-8)
+        self.eps = torch.tensor(1e-8).to(device)
         # How much to decay weights by on each step (1%*lr)
-        self.weight_decay = torch.tensor(1e-2)
+        self.weight_decay = torch.tensor(1e-2).to(device)
 
         # Model weights and biases and some non-learnable params.
         # Provided as a generator, turned into list here since
@@ -595,12 +595,12 @@ class AdamW_Impl:
         for p in self.parameters:
             if p.requires_grad:
                 # step gets set to 0 here because it gets incremeneted first thing in step() 
-                self.state[p]['step'] = torch.tensor(0)
+                self.state[p]['step'] = torch.tensor(0).to(device)
                 # initialize with same-shaped zeros tensors
                 # preserve_format = try to make the memory layout match the params layout
                 # so the gpu can do operations involving both faster.
-                self.state[p]['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                self.state[p]['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                self.state[p]['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format).to(device)
+                self.state[p]['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format).to(device)
 
     def zero_grad(self):
         """Reset gradients to zero for all weights.
