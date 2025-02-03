@@ -574,15 +574,15 @@ class AdamW_Impl:
         smoothed scale of the gradients, multiplied by the learning rate.
         """
         # Learning rate
-        self.lr = 3e-4          
+        self.lr = torch.tensor(3e-4)          
         # Beta coefficients for Adam
         # beta1 for the first moment (gradient smoothing)
         # beta2 for the second moment (gradient scaling)
-        self.betas = (0.9, 0.999)
+        self.betas = (torch.tensor(0.9), torch.tensor(0.999))
         # Tiny number to prevent division by 0
-        self.eps = 1e-8
+        self.eps = torch.tensor(1e-8)
         # How much to decay weights by on each step (1%*lr)
-        self.weight_decay = 1e-2
+        self.weight_decay = torch.tensor(1e-2)
 
         # Model weights and biases and some non-learnable params.
         # Provided as a generator, turned into list here since
@@ -595,7 +595,7 @@ class AdamW_Impl:
         for p in self.parameters:
             if p.requires_grad:
                 # step gets set to 0 here because it gets incremeneted first thing in step() 
-                self.state[p]['step'] = 0
+                self.state[p]['step'] = torch.tensor(0)
                 # initialize with same-shaped zeros tensors
                 # preserve_format = try to make the memory layout match the params layout
                 # so the gpu can do operations involving both faster.
@@ -644,9 +644,9 @@ class AdamW_Impl:
             # m_hat and v_hat divisor calculation
             step = state['step']
             # 1 - beta1^t
-            bias_correction1 = 1 - beta1 ** step
+            bias_correction1 = torch.tensor(1) - torch.pow(beta1, state['step'])
             # 1 - beta2^t
-            bias_correction2 = 1 - beta2 ** step
+            bias_correction2 = 1 - torch.tensor(1) - torch.pow(beta2, state['step'])
 
             # Final update denominator,
             # exp_avg_sq.div_(bias_correction2) = v_t / (1 - beta2^t) = v_hat
@@ -657,8 +657,8 @@ class AdamW_Impl:
             # but kept getting infs/nans.
             # now doing square rooting here, which works because
             # sqrt(x)/sqrt(y) = sqrt(x/y)
-            bias_correction2_sqrt = bias_correction2.sqrt()
-            denom = exp_avg_sq.sqrt().div_((bias_correction2_sqrt).add_(self.eps))
+            bias_correction2_sqrt = torch.sqrt(bias_correction2)
+            denom = exp_avg_sq.sqrt().div_((bias_correction2_sqrt + self.eps))
 
             # Update the weights
             # w(t) = w(t-1) - lr * m_hat / (sqrt(v_hat) + eps)
