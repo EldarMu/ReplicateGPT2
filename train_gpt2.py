@@ -255,7 +255,7 @@ class GPT(nn.Module):
           out_features=config.vocab_size,
           bias=False)
     
-    def forward(self, idx):
+    def forward(self, idx, predictions=None):
       # index of shape (batch_size, seq_len)
       batch_size, seq_len = idx.size()
       assert seq_len <= self.config.max_seq_len, f"cannot use sequence length {seq_len} > {self.config.max_seq_len}"
@@ -274,8 +274,17 @@ class GPT(nn.Module):
       data = self.transformer.final_layernorm(data) # shape is (batch_size, seq_len, hidden_dim)
       # run through the linear layer to get back to vocab space
       logits = self.lm_head(data) # shape is (batch_size, seq_len, vocab_size)
-      # return un-normalized probabilities, will need to softmax to get probabilities
-      return logits
+      # Get cross-entropy loss if real labels provided.
+      loss = None
+      if predictions is not None:
+        # logits.view(-1 = calculate this dim automatically so batch*tokens,
+        #             logits.size(-1) = vocab_size)
+        # predictions.view(-1) = starts as (B, T) now it's (B*T)
+        # May seem odd, we're calculating entropy for the whole training set,
+        # not per-batch. The reason is that this is a small model with a toy dataset.
+        loss = torchF.cross_entropy(logits.view(-1, logits.size(-1)), predictions.view(-1))
+      
+      return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -445,42 +454,37 @@ def test_model():
       decoded = enc.decode(tokens)
       print(">", decoded)
 
+def one_epoch_training():
+  # !wget https://raw.githubusercontent.com/karpathy/char-rnn/refs/heads/master/data/tinyshakespeare/input.txt
+  # pros: fully ascii no preprocessing needed cons: very small dataset, can easily find better ones on github or huggingface.
 
-# !wget https://raw.githubusercontent.com/karpathy/char-rnn/refs/heads/master/data/tinyshakespeare/input.txt
-# pros: fully ascii no preprocessing needed cons: very small dataset, can easily find better ones on github or huggingface.
+  # something about loading to cuda is busted colab with torch when we load model here.
+  device = 'cpu'
 
-# something about loading to cuda is busted colab with torch when we load model here.
-device = 'cpu'
+  # get the specific tokenizer used for gpt2 to tokenize/detokenize text.
+  enc = tiktoken.get_encoding('gpt2')
 
-# get the specific tokenizer used for gpt2 to tokenize/detokenize text.
-enc = tiktoken.get_encoding('gpt2')
+  # rename if you saved the shakespear text as something else.
+  with open('input.txt', 'r') as f:
+      text = f.read()
 
-# rename if you saved the shakespear text as something else.
-with open('input.txt', 'r') as f:
-    text = f.read()
+  # encode the text into token indices.
+  tokens = enc.encode(text)
 
-# encode the text into token indices.
-tokens = enc.encode(text)
+  # Forced to use the cpu due to torch device weirdness in colab,
+  # and at 12.7 gb RAM have to keep batch size low
+  # together these batch/length params use 10.8 GB RAM (minus ~1.4 os/python usage)
+  token_length = 128
+  batch_size = 32
+  # convert token indices to floats
+  buf = torch.tensor(tokens[:batch_size*token_length + 1])
 
-# Forced to use the cpu due to torch device weirdness in colab,
-# and at 12.7 gb RAM have to keep batch size low
-# together these batch/length params use 10.8 GB RAM (minus ~1.4 os/python usage)
-token_length = 128
-batch_size = 32
-# we load some portion of the dataset divisible into memory for training
-iterated_size = batch_size * token_length
-iterated_size = (len(tokens) // iterated_size) * iterated_size
-# validating here just in case.
-assert iterated_size + 1 < len(tokens), "use smaller token_length or batch_size"
-# convert token indices to floats
-buf = torch.tensor(tokens[:batch_size*token_length + 1])
+  # exclude first token from predictions since it has no context
+  predictions = buf[1:].view(batch_size, token_length)
+  # exclude last token from input since it has nothing to predict
+  data = buf[:-1].view(batch_size, token_length)
 
-# exclude first token from predictions since it has no context
-predictions = buf[1:].view(batch_size, token_length)
-# exclude last token from input since it has nothing to predict
-data = buf[:-1].view(batch_size, token_length)
-
-model = train_gpt2.GPT(train_gpt2.GPT2Parameters())
-model.to(device)
-logits = model(data)
-print(logits.shape)
+  model = GPT(GPT2Parameters())
+  model.to(device)
+  logits, loss = model(data, predictions)
+  print(loss)
