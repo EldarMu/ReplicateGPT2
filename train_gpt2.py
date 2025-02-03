@@ -666,7 +666,7 @@ class AdamW_Impl:
             # we just divide lr by (1-beta1^t) so we can use m(t) as-is.
             step_size = lr / bias_correction1
             # param_update = m(t) / (sqrt(v_hat) + eps)
-            param_update = exp_avg.div_(denom)
+            param_update = exp_avg / denom
             # alpha is just a multiplier for the values, so this is equivalent to
             # w(t-1) = w(t-1) + (m(t) / (sqrt(v_hat) + eps))*  -(lr / (1-beta1^t))
             # which is equivalent to w(t-1) - lr * m_hat / (sqrt(v_hat) + eps)
