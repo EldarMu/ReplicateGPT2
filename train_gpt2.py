@@ -658,7 +658,7 @@ class AdamW_Impl:
             # now doing square rooting here, which works because
             # sqrt(x)/sqrt(y) = sqrt(x/y)
             bias_correction2_sqrt = torch.sqrt(bias_correction2)
-            denom = exp_avg_sq.sqrt().div_((bias_correction2_sqrt + self.eps))
+            denom = exp_avg_sq.sqrt().div_(bias_correction2_sqrt).add_(self.eps)
 
             # Update the weights
             # w(t) = w(t-1) - lr * m_hat / (sqrt(v_hat) + eps)
