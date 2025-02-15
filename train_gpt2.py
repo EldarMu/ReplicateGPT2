@@ -215,7 +215,6 @@ class Block(nn.Module):
       # residual after FFN.
       data = data + self.mlp(self.ln_before_fnn(data))
       return data 
-      
 
 class GPT(nn.Module):
 
@@ -697,3 +696,64 @@ class AdamW_Impl:
             # w(t-1) = w(t-1) + (m(t) / (sqrt(v_hat) + eps))*  -(lr / (1-beta1^t))
             # which is equivalent to w(t-1) - lr * m_hat / (sqrt(v_hat) + eps)
             p.data.add_(param_update, alpha=-step_size)
+
+# previously cropped the data to fit into gpu memory, now iterating over it.
+# need to do data, labels = data.to_device(device), labels.to_device(device)
+class DataLoaderLite:
+    def __init__(self, batch_size, token_length, debug_print=False):
+        self.batch_size = batch_size
+        self.token_length = token_length
+        #!wget -nc https://raw.githubusercontent.com/karpathy/char-rnn/refs/heads/master/data/tinyshakespeare/input.txt
+        # at init load tokens from disk and store them in memory
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        if debug_print:
+          print(f"loaded {len(self.tokens)} tokens")
+          print(f"1 epoch = {len(self.tokens) // (batch_size * token_length)} batches")
+        # index for text, moves up as we use chunks of text
+        self.current_position = 0
+
+    def next_batch(self):
+        batch_size, token_length = self.batch_size, self.token_length
+        buf = self.tokens[self.current_position : 
+                          self.current_position+batch_size*token_length+1]
+        data = (buf[:-1]).view(batch_size, token_length)
+        labels = (buf[1:]).view(batch_size, token_length)
+        # advance the position in the tensor
+        self.current_position += batch_size * token_length
+        # if loading the next batch would be out of bounds, reset
+        if self.current_position + (batch_size * token_length
+                                    + 1) > len(self.tokens):
+            self.current_position = 0
+        return data, labels
+
+def train_model():
+  device = "cpu"
+  if torch.cuda.is_available():
+      device = "cuda"
+      torch.cuda.manual_seed(42)
+  print(f"using device: {device}")
+
+  # ok now using bf16 where possible instead of fp32 so use larger
+  # batch size and context length
+  torch.set_float32_matmul_precision('high')
+  token_length = 256
+  batch_size = 16
+  train_loader = DataLoaderLite(batch_size, token_length)
+
+  model = GPT(GPT2Parameters())
+  model.to(device)
+  model = torch.compile(model)
+  optimizer = AdamW_Impl(model.parameters(), device)
+  for i in range(100):
+      data, labels = train_loader.next_batch()
+      data, labels = data.to(device), labels.to(device)
+      optimizer.zero_grad()
+      with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(data, labels)
+      loss.backward()
+      optimizer.step()
+      print(f"step {i}, loss: {loss.item()}")
