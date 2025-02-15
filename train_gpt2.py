@@ -52,6 +52,8 @@ class CausalSelfAttention(nn.Module):
       in_features=config.hidden_dim,
       out_features=config.hidden_dim
     )
+    # param to tell us to actually scale by fan-in not just use a constant
+    self.out_projection.NANOGPT_SCALE_INIT = 1
     # storing these values for reference in forward()
     self.num_heads = config.num_heads
     self.hidden_dim = config.hidden_dim
@@ -186,6 +188,8 @@ class MLP(nn.Module):
       in_features=4*config.hidden_dim,
       out_features=config.hidden_dim
     )
+    # param to tell us to actually scale by fan-in not just use a constant
+    self.ffn2.NANOGPT_SCALE_INIT = 1
 
   def forward(self, data):
     data = self.ffn1(data)
@@ -255,6 +259,27 @@ class GPT(nn.Module):
           in_features=config.hidden_dim,
           out_features=config.vocab_size,
           bias=False)
+        # tie embedding weights with output layer weights.
+        # this saves a lot of parameters, but the model trains slower.
+        self.lm_head.weight = self.transformer.wte.weight
+
+        self.apply(self._init_weights)
+    
+    # matching gpt2 initialization
+    # we would normally use Xavier (sigmoid-like activations) or
+    # Kaiming (relu-like activations) initialization for this.
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        # not initializing LayerNorm, default is fine.
+
     
     def forward(self, idx, predictions=None):
       # index of shape (batch_size, seq_len)
@@ -489,7 +514,10 @@ def train_model():
   # pros: fully ascii no preprocessing needed cons: very small dataset, can easily find better ones on github or huggingface.
 
   # something about loading to cuda is busted colab with torch when we load model here.
-  device = 'cpu'
+  device = "cpu"
+  if torch.cuda.is_available():
+      device = "cuda"
+  print(f"using device: {device}")
 
   # get the specific tokenizer used for gpt2 to tokenize/detokenize text.
   enc = tiktoken.get_encoding('gpt2')
@@ -501,13 +529,11 @@ def train_model():
   # encode the text into token indices.
   tokens = enc.encode(text)
 
-  # Forced to use the cpu due to torch device weirdness in colab,
-  # and at 12.7 gb RAM have to keep batch size low
-  # together these batch/length params use 10.8 GB RAM (minus ~1.4 os/python usage)
-  token_length = 128
-  batch_size = 32
+  # Forced to use small vals since now we're storing grads and opt states too
+  token_length = 64
+  batch_size = 16
   # convert token indices to floats
-  buf = torch.tensor(tokens[:batch_size*token_length + 1])
+  buf = torch.tensor(tokens[:batch_size*token_length + 1]).to(device)
 
   # exclude first token from labels since it has no context
   labels = buf[1:].view(batch_size, token_length)
