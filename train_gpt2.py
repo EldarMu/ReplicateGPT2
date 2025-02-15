@@ -261,7 +261,7 @@ class GPT(nn.Module):
           bias=False)
         # tie embedding weights with output layer weights.
         # this saves a lot of parameters, but the model trains slower.
-        self.lm_head.weight = self.transformer.wte.weight
+        self.lm_head.weight = self.transformer.embedding_matrix.weight
 
         self.apply(self._init_weights)
     
@@ -272,7 +272,7 @@ class GPT(nn.Module):
         if isinstance(module, nn.Linear):
             std = 0.02
             if hasattr(module, 'NANOGPT_SCALE_INIT'):
-                std *= (2 * self.config.n_layer) ** -0.5
+                std *= (2 * self.config.num_decoders) ** -0.5
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
