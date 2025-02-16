@@ -7,14 +7,15 @@ This is meant to be a base from which to start adding various papers'
 improvements.
 """
 
-import math
 from collections import defaultdict
 from dataclasses import dataclass
+import math
+import tiktoken
+import time
 import torch
 import torch.nn as nn
 from torch.nn import functional as torchF
 from transformers import GPT2LMHeadModel
-import tiktoken
 
 # store all the parameters up top for easy modification.
 @dataclass
@@ -515,45 +516,38 @@ def test_model():
       print(">", decoded)
 
 def train_model():
-  # !wget https://raw.githubusercontent.com/karpathy/char-rnn/refs/heads/master/data/tinyshakespeare/input.txt
-  # pros: fully ascii no preprocessing needed cons: very small dataset, can easily find better ones on github or huggingface.
-
-  # something about loading to cuda is busted colab with torch when we load model here.
   device = "cpu"
   if torch.cuda.is_available():
       device = "cuda"
+      torch.cuda.manual_seed(42)
   print(f"using device: {device}")
 
-  # get the specific tokenizer used for gpt2 to tokenize/detokenize text.
-  enc = tiktoken.get_encoding('gpt2')
-
-  # rename if you saved the shakespear text as something else.
-  with open('input.txt', 'r') as f:
-      text = f.read()
-
-  # encode the text into token indices.
-  tokens = enc.encode(text)
-
-  # Forced to use small vals since now we're storing grads and opt states too
-  token_length = 64
+  # ok now using bf16 where possible instead of fp32 so use larger
+  # batch size and context length
+  torch.set_float32_matmul_precision('high')
+  token_length = 256
   batch_size = 16
-  # convert token indices to floats
-  buf = torch.tensor(tokens[:batch_size*token_length + 1]).to(device)
+  train_loader = DataLoaderLite(batch_size, token_length)
 
-  # exclude first token from labels since it has no context
-  labels = buf[1:].view(batch_size, token_length)
-  # exclude last token from input since it has nothing to predict
-  data = buf[:-1].view(batch_size, token_length)
-
-  model = GPT(GPT2Parameters())
+  model = GPT(GPT2Parameters(vocab_size=50304))
   model.to(device)
-  optimizer = AdamW_Impl(model.parameters())
-  for i in range(50):
-      optimizer.zero_grad()
+  model = torch.compile(model)
+  optimizer = AdamW_Impl(model.parameters(), device)
+  for i in range(100):
+    t0 = time.time()
+    data, labels = train_loader.next_batch()
+    data, labels = data.to(device), labels.to(device)
+    optimizer.zero_grad()
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
       logits, loss = model(data, labels)
-      loss.backward()
-      optimizer.step()
-      print(f"step {i}, loss: {loss.item()}")
+    loss.backward()
+    optimizer.step()
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0)*1000
+    tokens_per_sec = (train_loader.batch_size *
+                      train_loader.token_length) / (t1 - t0)
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
 
 class AdamW_Impl:
     def __init__(self, params, device):
@@ -609,7 +603,8 @@ class AdamW_Impl:
         # Beta coefficients for Adam
         # beta1 for the first moment (gradient smoothing)
         # beta2 for the second moment (gradient scaling)
-        self.betas = (torch.tensor(0.9).to(device), torch.tensor(0.999).to(device))
+        # beta2 updated from default in pytorch (0.999) to gpt2 value (0.995)  
+        self.betas = (torch.tensor(0.9).to(device), torch.tensor(0.995).to(device))
         # Tiny number to prevent division by 0
         self.eps = torch.tensor(1e-8).to(device)
         # How much to decay weights by on each step (1%*lr)
@@ -735,31 +730,3 @@ class DataLoaderLite:
                                     + 1) > len(self.tokens):
             self.current_position = 0
         return data, labels
-
-def train_model():
-  device = "cpu"
-  if torch.cuda.is_available():
-      device = "cuda"
-      torch.cuda.manual_seed(42)
-  print(f"using device: {device}")
-
-  # ok now using bf16 where possible instead of fp32 so use larger
-  # batch size and context length
-  torch.set_float32_matmul_precision('high')
-  token_length = 256
-  batch_size = 16
-  train_loader = DataLoaderLite(batch_size, token_length)
-
-  model = GPT(GPT2Parameters())
-  model.to(device)
-  model = torch.compile(model)
-  optimizer = AdamW_Impl(model.parameters(), device)
-  for i in range(100):
-      data, labels = train_loader.next_batch()
-      data, labels = data.to(device), labels.to(device)
-      optimizer.zero_grad()
-      with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(data, labels)
-      loss.backward()
-      optimizer.step()
-      print(f"step {i}, loss: {loss.item()}")
