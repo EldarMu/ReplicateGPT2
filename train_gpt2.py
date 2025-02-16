@@ -553,8 +553,9 @@ def train_model():
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # fetch learning rate and set the param for optimizer.
     lr = get_lr(i)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+    # since I implemented my own optimizer, there's no param_groups
+    # and I'm going to move it to device to match everything else.
+    optimizer.lr = torch.tensor(lr).to(device)
     # updates the weights using out optimizer.
     optimizer.step()
     # GPU is async, so the optimizer step above could
