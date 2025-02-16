@@ -137,6 +137,7 @@ class CausalSelfAttention(nn.Module):
               self.hidden_dim // self.num_heads).transpose(1, 2)
     v = v.view(batch_size, tokens, self.num_heads,
               self.hidden_dim // self.num_heads).transpose(1, 2)
+    """ V Previously implemented attention manually like so:
     # the attention operation, note division by sqrt(hidden_dim_per_head)
     # have to specify which dims get transposed, using pythonic notation
     # to refer to last two dims here, could've also said (2, 3),
@@ -164,6 +165,11 @@ class CausalSelfAttention(nn.Module):
     # then make contiguous because some of the operations
     # likely made copies and lost the stride info we had earlier.
     # then, get rid of the num_heads dimension to get original dims back.
+    """
+    # now implementing attention by calling the function
+    # it would be good to implement manually in triton
+    # but right now just swapping it in
+    out_data = torchF.scaled_dot_product_attention(q, k, v, is_causal=True)
     out_data = out_data.transpose(1, 2).contiguous().view(
       batch_size, tokens, hidden_dim
     )
