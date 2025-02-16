@@ -551,6 +551,10 @@ def train_model():
     # this does NOT scale to model size, practically we would at least
     # use per-layer norm instead, possibly make it start high and trend down.
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # fetch learning rate and set the param for optimizer.
+    lr = get_lr(i)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     # updates the weights using out optimizer.
     optimizer.step()
     # GPU is async, so the optimizer step above could
@@ -563,6 +567,26 @@ def train_model():
                       train_loader.token_length) / (t1 - t0)
     print(f"step {i:4d} | loss: {loss.item():.6f} | norm: {norm:.4f} |" +
           f" dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+
+# mostly unmofied from Karpathy's code just made comments more legible to me.
+def get_lr(it):
+  max_lr = 6e-4
+  min_lr = max_lr * 0.1
+  warmup_steps = 20
+  max_steps = 80
+  # scale to max value linearly for warmup steps
+  if it < warmup_steps:
+      return max_lr * (it+1) / warmup_steps
+  # If we're past max_steps clamp down to min_lr
+  if it > max_steps:
+      return min_lr
+  # In between, use cosine decay down to min learning rate
+  # That means smooth non-linear motion down.
+  decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+  assert 0 <= decay_ratio <= 1
+   # coeff starts at 1 and goes to 0
+  coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+  return min_lr + coeff * (max_lr - min_lr)
 
 class AdamW_Impl:
     def __init__(self, params, device):
