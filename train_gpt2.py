@@ -534,21 +534,35 @@ def train_model():
   model = torch.compile(model)
   optimizer = AdamW_Impl(model.parameters(), device)
   for i in range(100):
+    # time per-step.
     t0 = time.time()
+    # fetch next batch
     data, labels = train_loader.next_batch()
+    # load to device (GPU memory if available)
     data, labels = data.to(device), labels.to(device)
+    # ensure previous step's gradients don't pollute this step.
     optimizer.zero_grad()
+    # Training on colab T4 which doesn't use bfloat anyway, but this is how you'd do it.
     with torch.autocast(device_type=device, dtype=torch.bfloat16):
       logits, loss = model(data, labels)
+    # backpropagate for per-weight gradients (loss per weight)
     loss.backward()
+    # clip the sqrt(sum(all_grads^2)) to 1.0
+    # this does NOT scale to model size, practically we would at least
+    # use per-layer norm instead, possibly make it start high and trend down.
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # updates the weights using out optimizer.
     optimizer.step()
+    # GPU is async, so the optimizer step above could
+    # still be running on the GPU when we get here.
+    # synchronize() waits for all ops to finish.
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0)*1000
     tokens_per_sec = (train_loader.batch_size *
                       train_loader.token_length) / (t1 - t0)
-    print(f"step {i:4d} | loss: {loss.item():.6f} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    print(f"step {i:4d} | loss: {loss.item():.6f} | norm: {norm:.4f} |" +
+          f" dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 class AdamW_Impl:
     def __init__(self, params, device):
