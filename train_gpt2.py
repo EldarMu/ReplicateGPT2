@@ -590,7 +590,7 @@ def get_lr(it):
   return min_lr + coeff * (max_lr - min_lr)
 
 class AdamW_Impl:
-    def __init__(self, params, device):
+    def __init__(self, params, lr=3e-4, device='cpu'):
         """
         Very basic AdamW implementation.
         Tailored to this specific model, for educational purposes.
@@ -639,7 +639,8 @@ class AdamW_Impl:
         smoothed scale of the gradients, multiplied by the learning rate.
         """
         # Learning rate
-        self.lr = torch.tensor(3e-4).to(device)          
+        # can be set externally
+        self.lr = torch.tensor(lr).to(device)          
         # Beta coefficients for Adam
         # beta1 for the first moment (gradient smoothing)
         # beta2 for the second moment (gradient scaling)
@@ -694,7 +695,12 @@ class AdamW_Impl:
             # Weight decay applied first like in pytorch's single_tensor impl.
             # Weight decay: w(t) = w(t-1) - lr * weight_decay * w(t-1)
             # mul_ = in-place element-wise multiplication of the tensor
-            p.data.mul_(1 - lr * self.weight_decay)
+            #
+            # updated - now only happens for parameters that have more than 2 dims
+            # unlike Karpathy's code, this is in the optimizer itself since I rolled my own
+            # p.requires_grad is baked in since we check if p.grad is None above.
+            if (p.dim() >= 2):
+              p.data.mul_(1 - lr * self.weight_decay)
                 
 
             # m(t) = beta1 * m(t-1) + (1 - beta1) * g(t)
