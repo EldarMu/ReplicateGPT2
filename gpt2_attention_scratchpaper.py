@@ -113,7 +113,7 @@ class CausalSelfAttention(nn.Module):
 
   
   def forward(self, data, scratch_in=None):
-    use_scratch = self.scratch_enabled and (scratch_in is not None) and (self.lambda_s.item() > 1e-8)
+    use_scratch = self.scratch_enabled and (scratch_in is not None)
     if not use_scratch:
       batch_size, tokens, hidden_dim = data.size()
       qkv = self.qkv_projection(data)
@@ -165,25 +165,27 @@ class CausalSelfAttention(nn.Module):
 
       # Scratch logits: shape [batch_size, num_heads, tokens, tokens]
       logits_s = torch.matmul(Qs, Ks.transpose(-2, -1)) / math.sqrt(scratch_dim)
-      # have to fuzz the values a bit for first one so it's not identical
-      # in each value so we don't end up having to deal with softmax(z+c) = softmax(z)
-      eps = 1e-6
-      logits_s = logits_s - logits_s.mean(dim=-1, keepdim=True)
-      with torch.no_grad():
-          target_std = logits_c.detach().std(dim=-1, keepdim=True) + eps
-          current_std = logits_s.detach().std(dim=-1, keepdim=True) + eps
-      scale = (target_std / current_std).clamp(0.5, 2.0)
-      logits_s = logits_s * scale
       
-      # AI really fucking wants this per-head scalar.
+      # tensor-gated lambda; avoids branching & graph breaks
+      lambda_gate = (self.lambda_s > 1e-8).to(logits_c.dtype).view(1,1,1,1)
+      # per-head scalar value for models to learn so variable scratch usage.
       head_scl = torch.exp(self.per_head_scratch_scl).view(1, -1, 1, 1)
       # Combine the logits, applying the lambda_s scaling factor
-      total_logits = logits_c + self.lambda_s * head_scl * logits_s
+      total_logits = logits_c + (lambda_gate * self.lambda_s).view(1,1,1,1) * head_scl * logits_s
+      # if I get rid of head scaling can use like:
+      # total_logits = logits_c + (lambda_gate * self.lambda_s).view(1,1,1,1) * logits_s
       
-      # Apply Mask and Softmax
       # The stored bias has shape [1, 1, max_seq_len, max_seq_len]
-      total_logits = total_logits.masked_fill(self.bias[:,:,:tokens,:tokens] == 0, float('-inf'))
+      scratch_delta = (lambda_gate * self.lambda_s).view(1,1,1,1) * head_scl * logits_s
+      unmasked_logits = logits_c + scratch_delta
+
+      # get diagnostic vals before -inf masking
+      delta_logits_rms = scratch_delta.pow(2).mean().sqrt().detach()
+      row_std_ratio = (logits_s.std(dim=-1) / (logits_c.std(dim=-1) + 1e-6)).mean().detach()      
       
+      # mask for attention
+      total_logits = unmasked_logits.masked_fill(self.bias[:, :, :tokens, :tokens] == 0, float('-inf'))
+
       # Get attention weights from the combined scores
       attention_weights = torchF.softmax(total_logits, dim=-1)
 
@@ -196,9 +198,11 @@ class CausalSelfAttention(nn.Module):
       # Reshape content_out back to standard tensor format for the residual stream
       attn_out = content_out.transpose(1, 2).contiguous().view(batch_size, tokens, hidden_dim)
       attn_out = self.out_projection(attn_out)
-      row_std_ratio = (logits_s.std(dim=-1) / (logits_c.std(dim=-1) + 1e-6)).mean()
+
+      # collect some data on our new layers in lieue of visualizing.
       diags = {
-          'row_std_ratio': row_std_ratio.detach(),
+          'delta_logits_rms': delta_logits_rms,
+          'row_std_ratio': row_std_ratio,
       }
       return attn_out, scratch_out_mid, diags
 
@@ -256,7 +260,7 @@ class Block(nn.Module):
       data = data + self.mlp(self.ln_before_fnn(data))
 
       if scratch_out is not None:
-          diags['s_norm_out'] = scratch_out.norm().detach()
+          diags['s_rms_out'] = (scratch_out.pow(2).mean().sqrt()).detach()
 
       return data, scratch_out, diags
 
@@ -339,7 +343,7 @@ def train_model():
   model = torch.compile(model)
   optimizer = train_gpt2.AdamW_Impl(model.parameters(), device=device)
   max_steps = 1000
-  print("step|loss|λ|keep|add|s_norm|ratio|W_norm|grad_norm")
+  print("step|loss|λ|keep|add|s_rms|ratio|W_norm|grad_norm|delta")
   for i in range(max_steps):
     # time per-step.
     t0 = time.time()
@@ -374,8 +378,9 @@ def train_model():
         # Calculate average gate values across all layers
         avg_keep_gates = []
         avg_add_gates = []
+        avg_delta_logits_rms = []
         avg_row_std_ratio = []
-        avg_s_norm = []
+        avg_s_rms = []
         avg_W_norms = []
         # Use torch.no_grad to avoid tracking these operations for gradients
         with torch.no_grad():
@@ -389,20 +394,23 @@ def train_model():
             if all_diags:
                 for diags in all_diags:
                     avg_row_std_ratio.append(diags['row_std_ratio'].item())
-                    if 's_norm_out' in diags:
-                        avg_s_norm.append(diags['s_norm_out'].item())
-        
+                    if 's_rms_out' in diags:
+                      avg_s_rms.append(diags['s_rms_out'].item())
+                    if 'delta_logits_rms' in diags:
+                      avg_delta_logits_rms.append(diags['delta_logits_rms'].item())
+
         # Avoid division by zero if no writers found
         avg_keep = sum(avg_keep_gates) / len(avg_keep_gates) if avg_keep_gates else 0
         avg_add = sum(avg_add_gates) / len(avg_add_gates) if avg_add_gates else 0
         row_std_ratio = sum(avg_row_std_ratio) / len(avg_row_std_ratio) if avg_row_std_ratio else 0
-        s_norm = sum(avg_s_norm) / len(avg_s_norm) if avg_s_norm else 0
+        delta_logits_rms = sum(avg_delta_logits_rms)/len(avg_delta_logits_rms) if avg_delta_logits_rms else 0
+        s_rms = sum(avg_s_rms) / len(avg_s_rms) if avg_s_rms else 0
         W_norm = sum(avg_W_norms) / len(avg_W_norms) if avg_W_norms else 0
 
         print(
             f"{i}|{loss.item():.4f}|{current_lambda:.2f}|"
-            f"{avg_keep:.3f}|{avg_add:.3f}|{s_norm:.2f}|"
-            f"{row_std_ratio:.3f}|{W_norm:.2f}|{norm:.2f}"
+            f"{avg_keep:.3f}|{avg_add:.3f}|{s_rms:.2f}|"
+            f"{row_std_ratio:.3f}|{W_norm:.2f}|{norm:.2f}|{delta_logits_rms:.2f}"
         )
 
 
