@@ -4,7 +4,6 @@ which is a residual hooked up between just the attention blocks that influences 
 like notes for heads to pass forward.
 """
 
-from collections import defaultdict
 from dataclasses import dataclass
 import math
 import tiktoken
@@ -12,7 +11,7 @@ import time
 import torch
 import torch.nn as nn
 from torch.nn import functional as torchF
-from transformers import GPT2LMHeadModel
+from torch.optim import AdamW
 
 @dataclass
 class GPT2Parameters:
@@ -97,10 +96,8 @@ class CausalSelfAttention(nn.Module):
         self.Wk_s = nn.Parameter(torch.randn(Nh, Ds, Ds) * 0.02)
         self.Wv_s = nn.Parameter(torch.randn(Nh, Ds, Ds) * 0.02)
         self.register_buffer('lambda_s', torch.tensor(0.0))
-        # no fucking idea the name is shit but I think AI wanted this to be a per-head scratch gate?
-        # absolute shit name if that's the case, fucking asshole thinks he's writing a python notebook
-        # so no need to use even slightly reasonable names.
-        self.per_head_scratch_scl = nn.Parameter(torch.zeros(self.num_heads))
+
+        self.per_head_scratch_val = nn.Parameter(torch.zeros(self.num_heads))
 
     self.register_buffer(
       name='bias',
@@ -168,15 +165,15 @@ class CausalSelfAttention(nn.Module):
       
       # tensor-gated lambda; avoids branching & graph breaks
       lambda_gate = (self.lambda_s > 1e-8).to(logits_c.dtype).view(1,1,1,1)
-      # per-head scalar value for models to learn so variable scratch usage.
-      head_scl = torch.exp(self.per_head_scratch_scl).view(1, -1, 1, 1)
+      # per-head scalar value for models to learn for variable scratch usage.
+      per_head_val = torch.exp(self.per_head_scratch_val).view(1, -1, 1, 1)
       # Combine the logits, applying the lambda_s scaling factor
-      total_logits = logits_c + (lambda_gate * self.lambda_s).view(1,1,1,1) * head_scl * logits_s
+      total_logits = logits_c + (lambda_gate * self.lambda_s).view(1,1,1,1) * per_head_val * logits_s
       # if I get rid of head scaling can use like:
       # total_logits = logits_c + (lambda_gate * self.lambda_s).view(1,1,1,1) * logits_s
       
       # The stored bias has shape [1, 1, max_seq_len, max_seq_len]
-      scratch_delta = (lambda_gate * self.lambda_s).view(1,1,1,1) * head_scl * logits_s
+      scratch_delta = (lambda_gate * self.lambda_s).view(1,1,1,1) * per_head_val * logits_s
       unmasked_logits = logits_c + scratch_delta
 
       # get diagnostic vals before -inf masking
@@ -310,6 +307,7 @@ class GPT(nn.Module):
       pos_embed = self.transformer.pos_embed(pos)
       token_embed = self.transformer.embedding_matrix(idx)
       data = token_embed + pos_embed
+      # adding scratch state for attention blocks to pass forward
       scratch = None
       all_diags = []
       for decoder in self.transformer.heads:
@@ -341,7 +339,23 @@ def train_model():
   model = train_gpt2.GPT(train_gpt2.GPT2Parameters())
   model.to(device)
   model = torch.compile(model)
-  optimizer = train_gpt2.AdamW_Impl(model.parameters(), device=device)
+  # AdamW param groups: decay for tensors with dim >= 2; no decay for biases/LayerNorm/etc.
+  decay, no_decay = [], []
+  for n, p in model._orig_mod.named_parameters():
+      if not p.requires_grad:
+          continue
+      (decay if p.dim() >= 2 else no_decay).append(p)
+
+  optimizer = AdamW(
+      [
+          {"params": decay, "weight_decay": 1e-2},
+          {"params": no_decay, "weight_decay": 0.0},
+      ],
+      lr=train_gpt2.get_lr(0),
+      betas=(0.9, 0.995),
+      eps=1e-8,
+      fused=(device == "cuda"),
+  )
   max_steps = 1000
   print("step|loss|λ|keep|add|s_rms|ratio|W_norm|grad_norm|delta")
   for i in range(max_steps):
@@ -364,9 +378,8 @@ def train_model():
     # needs adjusting since doesn't scale
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = train_gpt2.get_lr(i)
-    # since I implemented my own optimizer, there's no param_groups
-    # and I'm going to move it to device to match everything else.
-    optimizer.lr = torch.tensor(lr).to(device)
+    for pg in optimizer.param_groups:
+        pg["lr"] = lr
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
@@ -438,161 +451,6 @@ def get_lr(it):
    # coeff starts at 1 and goes to 0
   coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
   return min_lr + coeff * (max_lr - min_lr)
-
-class AdamW_Impl:
-    def __init__(self, params, lr=3e-4, device='cpu'):
-        """
-        Very basic AdamW implementation.
-        Tailored to this specific model, for educational purposes.
-        Also I hardcoded values usually passed into constructor so I don't have to
-        write all kinds of "raise ValueError" checks.
-
-        AdamW formula is:
-        t = our step (iteration) value. We increment this each time we perform a step,
-        so for this implementation, it's once per epoch (since we're doing full-batch).
-        Starts at 1, not 0.
-
-        g(t) = gradient at iteration t.
-        (we get the gradients from loss.backwards() auto-populated in params for us)
-
-        Weight adjustment, for the stored weights from previous step.
-        For us this means subtract lr-adjusted 1% (1e-2) of the existing weight.
-        w(t) = w(t-1) - lr * weight_decay * w(t-1)
-        
-        first moment:
-        m(t) = beta1 * m(t-1) + (1 - beta1) * g(t)
-        For our implementation, this means 90% of previous step's smoothed gradients, 10% of current.
-        Kind of like EMA, for gradient smoothing.
-
-        second moment:
-        v(t) = beta2 * v(t-1) + (1 - beta2) * g(t)^2
-        Like EMA of the scale of the gradients.
-        This ends up in the divisor so it slows down lr when gradients are large and vice-versa.
-
-        m(t) adjustment:
-        since we start with zeros, the value would increase super slow, so we adjust it by this,
-        and since the beta is 0.9, first step is m(t)/0.1 then /0.19, then /0.27 and so on.
-        m_hat = m(t) / (1 - beta1^t)
-
-        v(t) adjustment, same idea, but /0.01, then /0.019, then /0.03 and so on.
-        v_hat = v(t) / (1 - beta2^t)
-
-        Without the betas/epsilon the final formula would be:
-        w(t) = w(t-1) - lr * g(t)/(sqrt(g(t)^2)) so like lr with gradient sign retention.
-        (just showing so it's easier for you to connect all the dots)
-
-        finally, we update the weights:
-        v_hat can easily underflow, so we add a tiny number to it.
-        w(t) = w(t-1) - lr * m_hat / (sqrt(v_hat) + eps)
-
-        so the weight gets updated by the smoothed gradient divided by the
-        smoothed scale of the gradients, multiplied by the learning rate.
-        """
-        # Learning rate
-        # can be set externally
-        self.lr = torch.tensor(lr).to(device)          
-        # Beta coefficients for Adam
-        # beta1 for the first moment (gradient smoothing)
-        # beta2 for the second moment (gradient scaling)
-        # beta2 updated from default in pytorch (0.999) to gpt2 value (0.995)  
-        self.betas = (torch.tensor(0.9).to(device), torch.tensor(0.995).to(device))
-        # Tiny number to prevent division by 0
-        self.eps = torch.tensor(1e-8).to(device)
-        # How much to decay weights by on each step (1%*lr)
-        self.weight_decay = torch.tensor(1e-2).to(device)
-
-        # Model weights and biases and some non-learnable params.
-        # Provided as a generator, turned into list here since
-        # generators are intended for one run and we might iterate more than once.
-        self.parameters = list(params)
-        # defaultdict makes it so instead of KeyError you get a default value.
-        self.state = defaultdict(dict)
-
-        # add step, first moment, second moment vars for each tensor.
-        for p in self.parameters:
-            if p.requires_grad:
-                # step gets set to 0 here because it gets incremeneted first thing in step() 
-                self.state[p]['step'] = torch.tensor(0).to(device)
-                # initialize with same-shaped zeros tensors
-                # preserve_format = try to make the memory layout match the params layout
-                # so the gpu can do operations involving both faster.
-                self.state[p]['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format).to(device)
-                self.state[p]['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format).to(device)
-
-    def zero_grad(self):
-        """Reset gradients to zero for all weights.
-           Don't want to pollute between epochs."""
-        for p in self.parameters:
-            if p.grad is not None:
-                p.grad.zero_()
-
-    def step(self):
-        """Performs a single optimization step."""
-        for p in self.parameters:
-            # skip non-learnable params
-            if p.grad is None:
-                continue
-
-            grad = p.grad
-            state = self.state[p]
-
-            state['step'] += 1
-            exp_avg = state['exp_avg']
-            exp_avg_sq = state['exp_avg_sq']
-            beta1, beta2 = self.betas
-            lr = self.lr
-
-            # Weight decay applied first like in pytorch's single_tensor impl.
-            # Weight decay: w(t) = w(t-1) - lr * weight_decay * w(t-1)
-            # mul_ = in-place element-wise multiplication of the tensor
-            #
-            # updated - now only happens for parameters that have more than 2 dims
-            # unlike Karpathy's code, this is in the optimizer itself since I rolled my own
-            # p.requires_grad is baked in since we check if p.grad is None above.
-            if (p.dim() >= 2):
-              p.data.mul_(1 - lr * self.weight_decay)
-                
-
-            # m(t) = beta1 * m(t-1) + (1 - beta1) * g(t)
-            # lerp_ = in-place per-element weighted average of two tensors (grad and exp_avg)
-            exp_avg.lerp_(grad, 1 - beta1)
-
-            # v(t) = beta2 * v(t-1) + (1 - beta2) * g(t)^2
-            # mul_ = multiply v(t-1) by beta2 in-place
-            # addcmul_ = in-place element-wise multiply grad by grad, then by (1-beta2),
-            # then add to v(t-1)
-            exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-
-            # m_hat and v_hat divisor calculation
-            step = state['step']
-            # 1 - beta1^t
-            bias_correction1 = torch.tensor(1) - torch.pow(beta1, state['step'])
-            # 1 - beta2^t
-            bias_correction2 = torch.tensor(1) - torch.pow(beta2, state['step'])
-
-            # Final update denominator,
-            # exp_avg_sq.div_(bias_correction2) = v_t / (1 - beta2^t) = v_hat
-            # and then the whole thing is the (sqrt(v_hat) + eps)
-            #
-            # previously did this as one step like:
-            # denom = torch.sqrt(exp_avg_sq.div_(bias_correction2)).add_(self.eps)
-            # but kept getting infs/nans.
-            # now doing square rooting here, which works because
-            # sqrt(x)/sqrt(y) = sqrt(x/y)
-            bias_correction2_sqrt = torch.sqrt(bias_correction2)
-            denom = exp_avg_sq.sqrt().div_(bias_correction2_sqrt).add_(self.eps)
-
-            # Update the weights
-            # w(t) = w(t-1) - lr * m_hat / (sqrt(v_hat) + eps)
-            # since we didn't calculate m_hat separately, and m_hat is m(t) / (1 - beta1^t)
-            # we just divide lr by (1-beta1^t) so we can use m(t) as-is.
-            step_size = lr / bias_correction1
-            # param_update = m(t) / (sqrt(v_hat) + eps)
-            param_update = exp_avg / denom
-            # alpha is just a multiplier for the values, so this is equivalent to
-            # w(t-1) = w(t-1) + (m(t) / (sqrt(v_hat) + eps))*  -(lr / (1-beta1^t))
-            # which is equivalent to w(t-1) - lr * m_hat / (sqrt(v_hat) + eps)
-            p.data.add_(param_update, alpha=-step_size)
 
 # need to do data, labels = data.to_device(device), labels.to_device(device)
 class DataLoaderLite:
